@@ -120,6 +120,11 @@ def load_history() -> pd.DataFrame:
 def save_history(new_df: pd.DataFrame):
     existing = load_history()
     combined = pd.concat([existing, new_df], ignore_index=True) if not existing.empty else new_df
+    
+    # ↓↓↓ 【ここを追加】並び替える前に、すべてを確実に「日時データ」に変換して統一する ↓↓↓
+    combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
+    # ↑↑↑
+    
     combined = combined.drop_duplicates(subset=["date"], keep="last")
     combined = combined.sort_values("date").reset_index(drop=True)
     conn.update(worksheet="history", data=combined)
