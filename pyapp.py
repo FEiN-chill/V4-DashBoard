@@ -280,11 +280,12 @@ def migrate_legacy_data():
     # 旧 settings を読む
     old_s = {}
     try:
-        df_old = conn.read(worksheet="settings", ttl=5)  # 移行時はキャッシュ短く
-        df_old = df_old.dropna(subset=["key"])
-        old_s = dict(zip(df_old["key"], df_old["value"]))
-    except Exception as e:
-        st.warning(f"旧 settings の読み込みをスキップしました: {e}")
+        df_old = conn.read(worksheet="settings", ttl=5)
+        if df_old is not None and not df_old.empty and "key" in df_old.columns:
+            df_old = df_old.dropna(subset=["key"])
+            old_s = dict(zip(df_old["key"].astype(str), df_old["value"].astype(str)))
+    except Exception:
+        pass
 
     if old_s:
         pos = _make_default_position("Position 1 (migrated)")
@@ -302,8 +303,10 @@ def migrate_legacy_data():
                 pos["FEE_TARGET_MONTHLY"] = float(old_s["FEE_TARGET_MONTHLY"])
             except Exception:
                 pass
-
-        add_position(pos)
+        try:
+            add_position(pos)
+        except Exception:
+            pass
 
         # history に pos_id を付与
         try:
@@ -311,13 +314,87 @@ def migrate_legacy_data():
             if not hist.empty:
                 hist["pos_id"] = hist["pos_id"].fillna("legacy").replace("", "legacy")
                 _write_history(hist)
-        except Exception as e:
-            st.warning(f"履歴の pos_id 付与をスキップ: {e}")
+        except Exception:
+            pass
 
-        st.toast("✅ 旧データを移行しました", icon="📦")
-    else:
-        # settings も無い = 完全に新規
-        st.info("旧データが見つかりませんでした。新規にポジションを作成してください。")
+
+def run_manual_migration():
+    """デバッグ用：ステップごとに結果を表示する手動移行"""
+    results = []
+
+    # Step 1: settings 読み込み
+    results.append("**Step 1:** settings ワークシートを読み込み中...")
+    old_s = {}
+    try:
+        df_old = conn.read(worksheet="settings", ttl=5)
+        if df_old is None or df_old.empty:
+            results.append(f"⚠️ settings が空です (None={df_old is None})")
+        elif "key" not in df_old.columns:
+            results.append(f"⚠️ 'key' 列がありません。列: {list(df_old.columns)}")
+        else:
+            df_old = df_old.dropna(subset=["key"])
+            old_s = dict(zip(df_old["key"].astype(str), df_old["value"].astype(str)))
+            results.append(f"✅ {len(old_s)} 件の設定を読み込みました: {list(old_s.keys())}")
+    except Exception as e:
+        results.append(f"❌ settings 読み込み失敗: {e}")
+
+    if not old_s:
+        results.append("⛔ 設定データが無いため移行できません")
+        return results
+
+    # Step 2: ポジション作成
+    results.append("**Step 2:** ポジションデータを作成中...")
+    pos = _make_default_position("Position 1 (migrated)")
+    pos["pos_id"] = "legacy"
+    for k in POSITIONS_NUMERIC:
+        if k in old_s:
+            try:
+                pos[k] = float(old_s[k])
+            except Exception:
+                pass
+    if "PHASE_START_DATE" in old_s:
+        pos["PHASE_START_DATE"] = old_s["PHASE_START_DATE"]
+    results.append(f"✅ ポジション作成: Tick {int(pos['TICK_LOWER'])}–{int(pos['TICK_UPPER'])}, USDC={pos['INITIAL_USDC']}, JPYC={pos['INITIAL_JPYC']}")
+
+    # Step 3: positions に書き込み
+    results.append("**Step 3:** positions ワークシートに書き込み中...")
+    df_pos = pd.DataFrame([pos])
+    try:
+        conn.update(worksheet="positions", data=df_pos)
+        results.append("✅ conn.update() 成功")
+    except Exception as e1:
+        results.append(f"⚠️ conn.update() 失敗: {e1}")
+        try:
+            conn.create(worksheet="positions", data=df_pos)
+            results.append("✅ conn.create() で代替成功")
+        except Exception as e2:
+            results.append(f"❌ conn.create() も失敗: {e2}")
+            return results
+
+    # Step 4: history に pos_id 付与
+    results.append("**Step 4:** history に pos_id 列を追加中...")
+    try:
+        hist = conn.read(worksheet="history", ttl=5)
+        if hist is not None and not hist.empty:
+            if "pos_id" not in hist.columns:
+                hist.insert(0, "pos_id", "legacy")
+                results.append(f"✅ pos_id 列を追加 ({len(hist)} 行)")
+            else:
+                hist["pos_id"] = hist["pos_id"].fillna("legacy")
+                results.append(f"✅ 既存 pos_id を補完 ({len(hist)} 行)")
+            try:
+                conn.update(worksheet="history", data=hist)
+                results.append("✅ history 書き込み成功")
+            except Exception as e:
+                results.append(f"❌ history 書き込み失敗: {e}")
+        else:
+            results.append("⚠️ history が空です")
+    except Exception as e:
+        results.append(f"❌ history 読み込み失敗: {e}")
+
+    st.cache_data.clear()
+    results.append("**🎉 移行完了！ページをリロードしてください。**")
+    return results
 
 
 # ============================================================
@@ -745,14 +822,28 @@ with col_main:
 
     if all_positions.empty:
         st.markdown("""
-        <div style="text-align:center;padding:80px 20px;border:1px dashed rgba(255,255,255,0.1);
+        <div style="text-align:center;padding:60px 20px;border:1px dashed rgba(255,255,255,0.1);
             border-radius:16px;background:rgba(255,255,255,0.02);">
             <div style="font-size:3rem;margin-bottom:16px;">📊</div>
             <div style="color:#8b949e;font-size:1rem;font-weight:500;">ポジションがありません</div>
             <div style="color:#555f6e;font-size:0.82rem;margin-top:8px;">
-                右パネルの「Add New Position」から作成してください
+                右パネルの「Add New Position」から新規作成するか、下の移行ボタンで旧データを取り込んでください
             </div>
         </div>""", unsafe_allow_html=True)
+
+        st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
+
+        with st.expander("🔧 旧データ移行ツール（デバッグ付き）", expanded=True):
+            st.caption("settings → positions への移行をステップごとに実行し、各ステップの成功/失敗を表示します。")
+            if st.button("▶️ 手動で移行を実行", type="primary", use_container_width=True):
+                results = run_manual_migration()
+                for r in results:
+                    st.markdown(r)
+                st.markdown("---")
+                st.caption("上記の結果を確認し、問題があればスクリーンショットを共有してください。成功した場合はページをリロードしてください。")
+                if st.button("🔄 リロード"):
+                    st.rerun()
+
         st.stop()
 
     # ==========================================================
