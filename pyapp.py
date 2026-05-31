@@ -123,17 +123,35 @@ def load_positions() -> pd.DataFrame:
     """positions ワークシートから全ポジション設定を読み込む"""
     try:
         df = conn.read(worksheet="positions", ttl=600)
+        if df is None or df.empty:
+            return pd.DataFrame(columns=POSITIONS_COLS)
+        if "pos_id" not in df.columns:
+            return pd.DataFrame(columns=POSITIONS_COLS)
         df = df.dropna(subset=["pos_id"])
+        if df.empty:
+            return pd.DataFrame(columns=POSITIONS_COLS)
         for c in POSITIONS_NUMERIC:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-        df["active"] = df["active"].astype(str).str.lower().isin(["true", "1", "yes"])
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+        if "active" in df.columns:
+            df["active"] = df["active"].astype(str).str.lower().isin(["true", "1", "yes"])
+        else:
+            df["active"] = True
         return df
     except Exception:
         return pd.DataFrame(columns=POSITIONS_COLS)
 
 
 def save_positions(df: pd.DataFrame):
-    conn.update(worksheet="positions", data=df)
+    try:
+        conn.update(worksheet="positions", data=df)
+    except Exception:
+        # ワークシートが存在しない場合は新規作成
+        try:
+            conn.create(worksheet="positions", data=df)
+        except Exception as e:
+            st.error(f"positions ワークシートの書き込みに失敗しました: {e}")
+            return
     st.cache_data.clear()
 
 
@@ -204,7 +222,14 @@ def load_history(pos_id: str) -> pd.DataFrame:
 
 def _write_history(df: pd.DataFrame):
     """履歴ワークシートを丸ごと上書き"""
-    conn.update(worksheet="history", data=df)
+    try:
+        conn.update(worksheet="history", data=df)
+    except Exception:
+        try:
+            conn.create(worksheet="history", data=df)
+        except Exception as e:
+            st.error(f"history ワークシートの書き込みに失敗しました: {e}")
+            return
     st.cache_data.clear()
 
 
@@ -253,12 +278,13 @@ def migrate_legacy_data():
         return  # 既に移行済み
 
     # 旧 settings を読む
+    old_s = {}
     try:
-        df_old = conn.read(worksheet="settings", ttl=600)
+        df_old = conn.read(worksheet="settings", ttl=5)  # 移行時はキャッシュ短く
         df_old = df_old.dropna(subset=["key"])
         old_s = dict(zip(df_old["key"], df_old["value"]))
-    except Exception:
-        old_s = {}
+    except Exception as e:
+        st.warning(f"旧 settings の読み込みをスキップしました: {e}")
 
     if old_s:
         pos = _make_default_position("Position 1 (migrated)")
@@ -276,13 +302,22 @@ def migrate_legacy_data():
                 pos["FEE_TARGET_MONTHLY"] = float(old_s["FEE_TARGET_MONTHLY"])
             except Exception:
                 pass
+
         add_position(pos)
 
         # history に pos_id を付与
-        hist = load_history_all()
-        if not hist.empty:
-            hist["pos_id"] = hist["pos_id"].fillna("legacy").replace("", "legacy")
-            _write_history(hist)
+        try:
+            hist = load_history_all()
+            if not hist.empty:
+                hist["pos_id"] = hist["pos_id"].fillna("legacy").replace("", "legacy")
+                _write_history(hist)
+        except Exception as e:
+            st.warning(f"履歴の pos_id 付与をスキップ: {e}")
+
+        st.toast("✅ 旧データを移行しました", icon="📦")
+    else:
+        # settings も無い = 完全に新規
+        st.info("旧データが見つかりませんでした。新規にポジションを作成してください。")
 
 
 # ============================================================
